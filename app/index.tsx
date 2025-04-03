@@ -11,20 +11,24 @@ type GearRatios = Record<Exclude<Gear, -1 | 0>, GearRatio>;
 
 // Constants for physics simulation
 const ENGINE_BRAKING = 0.98;
-const ROLLING_RESISTANCE = 0.995;
+const ROLLING_RESISTANCE = 1;
 const AIR_RESISTANCE = 0.0002;
 const IDLE_RPM = 800;
-const STALL_RPM = 500;
+const STALL_RPM = 600;
 const MAX_RPM = 8000;
-const RPM_CHANGE_RATE = 50; // Increased for more responsive RPM changes
+const RPM_CHANGE_RATE = 50;
 const CLUTCH_SLIP_FACTOR = 0.7;
-const POWER_TRANSFER_RATE = 0.1; // Added for smoother power transfer
+const POWER_TRANSFER_RATE = 0.5;  // Increased from 0.1 to 0.5
+const SPEED_TO_RPM_FACTOR = 100;  // Conversion factor from speed to RPM
+const ENGINE_INERTIA = 0.8;       // How quickly engine RPM changes
+const VEHICLE_INERTIA = 0.6;      // How quickly the vehicle responds to power changes
+const ACCELERATION_FACTOR = 2.0;  // Added stronger acceleration factor
 
 export default function Index() {
   const [rpm, setRpm] = useState(0);
   const [speed, setSpeed] = useState(0);
   const [currentGear, setCurrentGear] = useState<Gear>(0);
-  const [clutchPosition, setClutchPosition] = useState(1); // Start with clutch pressed
+  const [clutchPosition, setClutchPosition] = useState(1);
   const [gasPosition, setGasPosition] = useState(0);
   const [isStalled, setIsStalled] = useState(false);
   const [isEngineRunning, setIsEngineRunning] = useState(false);
@@ -54,33 +58,11 @@ export default function Index() {
 
   const handleGearChange = (newGear: Gear) => {
     if (!isEngineRunning || isStalled) return;
-    if (clutchPosition < 0.8) return;
+    if (clutchPosition < 0.8) return; 
     
     if (newGear === 0) {
       setCurrentGear(newGear);
       return;
-    }
-    
-    const targetGear = newGear as Exclude<Gear, -1 | 0>;
-    const { minRpm, maxRpm } = gearRatios[targetGear];
-    
-    // More realistic gear change logic
-    if (currentGear > 0) {
-      const currentRatio = gearRatios[currentGear as Exclude<Gear, -1 | 0>].ratio;
-      const newRatio = gearRatios[targetGear].ratio;
-      const expectedRpm = rpm * (newRatio / currentRatio);
-      
-      if (expectedRpm < minRpm * 0.7) {
-        setIsStalled(true);
-        setRpm(0);
-        return;
-      }
-      
-      if (expectedRpm > maxRpm * 1.2) {
-        return; // Prevent gear change if RPM would be too high
-      }
-      
-      setRpm(Math.min(MAX_RPM, Math.max(IDLE_RPM, expectedRpm)));
     }
     
     setCurrentGear(newGear);
@@ -90,86 +72,125 @@ export default function Index() {
     if (!isEngineRunning) return;
   
     const now = Date.now();
-    const deltaTime = (now - lastUpdateTime.current) / 1000;
+    const deltaTime = Math.min((now - lastUpdateTime.current) / 1000, 0.1);
     lastUpdateTime.current = now;
   
-    // Stalling logic
-    if (rpm < STALL_RPM && currentGear !== 0 && clutchPosition < 0.2) {
-      setIsStalled(true);
-      setRpm(0);
-      return;
+    const clutchFactor = Math.pow(clutchPosition, 2);
+    
+    if (currentGear !== 0 && clutchFactor < 0.05) {
+      const minRpmNeeded = STALL_RPM * (1 - Math.min(gasPosition * 0.7, 0.6));
+      
+      if (rpm < minRpmNeeded) {
+        setIsStalled(true);
+        setRpm(0);
+        return;
+      }
     }
   
-    // Restart logic
     if (isStalled && clutchPosition > 0.8) {
       setIsStalled(false);
       setRpm(IDLE_RPM);
+      return;
     }
   
-    // RPM calculation
-    if (!isStalled) {
-      setRpm(prevRpm => {
-        let newRpm = prevRpm;
+    if (isStalled) return;
   
-        // Base engine behavior (without any load)
-        const engineTargetRpm = IDLE_RPM + (gasPosition * (MAX_RPM - IDLE_RPM));
+    setRpm(prevRpm => {
+      let newRpm = prevRpm;
+      
+      const engineTargetRpm = IDLE_RPM + (gasPosition * (MAX_RPM - IDLE_RPM));
+      
+      if (currentGear === 0 || clutchPosition > 0.95) {
+        newRpm += (engineTargetRpm - newRpm) * ENGINE_INERTIA * deltaTime * 10;
+      } 
+      else {
+        const wheelRpm = currentGear === -1 ? 0 : 
+          speed * SPEED_TO_RPM_FACTOR * gearRatios[Math.abs(currentGear) as Exclude<Gear, -1 | 0>].ratio;
         
-        if (currentGear === 0) {
-          // Neutral gear - engine follows gas pedal freely
-          newRpm += (engineTargetRpm - newRpm) * 0.3;
-        } 
-        else if (clutchPosition > 0.8) {
-          // Clutch fully pressed - engine follows gas pedal freely
-          newRpm += (engineTargetRpm - newRpm) * 0.3;
-        }
-        else {
-          // In gear with clutch engaged
-          const { ratio, minRpm, maxRpm } = gearRatios[currentGear as Exclude<Gear, -1 | 0>];
-          const wheelRpm = (speed * ratio * 100) / 60; // RPM based on current speed
+        if (clutchFactor < 0.05) {
+          newRpm = wheelRpm;
           
-          // When clutch is fully released (clutchPosition < 0.2)
-          if (clutchPosition < 0.2) {
-            // RPM is primarily determined by wheel speed
-            newRpm = wheelRpm;
-            
-            // Gas pedal can increase RPM slightly beyond wheel speed
-            if (gasPosition > 0) {
-              newRpm += gasPosition * 500 * deltaTime;
-            }
+          if (gasPosition > 0) {
+            const gasPower = gasPosition * 500 * deltaTime;
+            newRpm += Math.min(gasPower, 200 * deltaTime);
           }
-          else {
-            // Clutch is partially engaged - blend between wheel speed and engine power
-            const clutchEffect = Math.pow(clutchPosition, 3); // More sensitivity at high clutch values
-            newRpm = wheelRpm * (1 - clutchEffect) + engineTargetRpm * clutchEffect;
+        } 
+        else if (clutchFactor > 0.95) {
+          newRpm += (engineTargetRpm - newRpm) * ENGINE_INERTIA * deltaTime * 10;
+        } 
+        else {
+          const slipFactor = 1 - clutchFactor;
+          
+          let enginePull = (wheelRpm - newRpm) * slipFactor * deltaTime * 15;
+          
+          if (gasPosition > 0.1) {
+            enginePull *= (1 - gasPosition * 0.7);
           }
-  
-          // Enforce gear-specific RPM limits
-          newRpm = Math.max(minRpm * 0.8, Math.min(maxRpm, newRpm));
+          
+          const gasPush = (engineTargetRpm - newRpm) * (clutchFactor + gasPosition * 0.5) * ENGINE_INERTIA * deltaTime * 10;
+          
+          newRpm += enginePull + gasPush;
         }
+      }
+      
+      if (Math.abs(gasPosition) < 0.05 && Math.abs(newRpm - IDLE_RPM) < 100) {
+        newRpm += (Math.random() - 0.5) * 10;
+      }
+      
+      return Math.min(MAX_RPM, Math.max(0, newRpm));
+    });
   
-        // Small random fluctuations at idle
-        if (gasPosition === 0 && Math.abs(newRpm - IDLE_RPM) < 100) {
-          newRpm += (Math.random() - 0.5) * 20;
-        }
-  
-        return Math.min(MAX_RPM, Math.max(0, newRpm));
-      });
-    }
-  
-    // Speed calculation
     setSpeed(prevSpeed => {
       let newSpeed = prevSpeed;
       
-      // Apply resistance
       newSpeed *= ROLLING_RESISTANCE;
-      newSpeed -= newSpeed * newSpeed * AIR_RESISTANCE;
+      newSpeed -= newSpeed * newSpeed * AIR_RESISTANCE * deltaTime;
       
-      // Only apply power when in gear, clutch engaged, and not stalled
-      if (currentGear > 0 && clutchPosition < 0.2 && !isStalled) {
-        const { ratio } = gearRatios[currentGear as Exclude<Gear, -1 | 0>];
-        const effectiveRpm = rpm * (1 - clutchPosition);
-        const power = (effectiveRpm / ratio) * (gasPosition > 0 ? gasPosition : 0.1);
-        newSpeed += power * POWER_TRANSFER_RATE * deltaTime;
+      if (currentGear !== 0 && !isStalled) {
+        const gearRatio = gearRatios[Math.abs(currentGear) as Exclude<Gear, -1 | 0>].ratio;
+        const direction = currentGear < 0 ? -1 : 1;
+        
+        const clutchEngagement = 1 - clutchFactor;
+        
+        if (clutchEngagement > 0.01) {
+          const rpmFactor = rpm / MAX_RPM;
+          let torqueFactor;
+          
+          if (rpm < IDLE_RPM) {
+            torqueFactor = 0.1;
+          } else if (rpm < 2000) {
+            torqueFactor = 0.5 + (rpm - IDLE_RPM) / (2000 - IDLE_RPM) * 0.8;
+          } else if (rpm < 5000) {
+            torqueFactor = 1.3 - (rpm - 2000) / 3000 * 0.2;
+          } else {
+            torqueFactor = 1.1 - (rpm - 5000) / (MAX_RPM - 5000) * 0.4;
+          }
+          
+          const engineForce = torqueFactor * (gasPosition * 2 + 0.3) * direction;
+          
+          const powerTransfer = engineForce * clutchEngagement * gearRatio * deltaTime * POWER_TRANSFER_RATE * ACCELERATION_FACTOR;
+          
+          const gearEfficiency = 1 + (6 - Math.abs(currentGear as number)) * 0.5;  
+          newSpeed += powerTransfer * gearEfficiency;
+          
+          if (gasPosition < 0.1 && clutchEngagement > 0.8) {
+            newSpeed *= ENGINE_BRAKING;
+          }
+          
+          const wheelRpm = newSpeed * SPEED_TO_RPM_FACTOR * gearRatio;
+          const rpmDifference = rpm - wheelRpm;
+          
+          // Apply clutch slip effect - this creates resistance when clutch is slipping
+          if (Math.abs(rpmDifference) > 500 && clutchEngagement > 0.1 && clutchEngagement < 0.9) {
+            // Reduce slip resistance when giving gas (easier to get moving)
+            const gasReduction = 1 - Math.min(gasPosition * 0.7, 0.6);
+            const slipResistance = Math.min(Math.abs(rpmDifference) / 2000, 1) * 
+                                  clutchEngagement * (1 - clutchEngagement) * 4 * 
+                                  gasReduction;
+            
+            newSpeed -= Math.sign(newSpeed) * slipResistance * deltaTime * 5;
+          }
+        }
       }
       
       return Math.max(0, newSpeed);
